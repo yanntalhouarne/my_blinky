@@ -600,7 +600,7 @@ static inline bool z_impl_device_is_ready(const struct device *dev)
 	compiler_barrier();
 	return z_impl_k_sleep(timeout);
      408:	2100      	movs	r1, #0
-     40a:	f44f 4000 	mov.w	r0, #32768	; 0x8000
+     40a:	f640 40cd 	movw	r0, #3277	; 0xccd
      40e:	f003 fb77 	bl	3b00 <z_impl_k_sleep>
  * @return Zero if the requested time has elapsed or the number of milliseconds
  * left to sleep, if thread was woken up by \ref k_wakeup call.
