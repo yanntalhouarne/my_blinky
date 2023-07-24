@@ -9,27 +9,47 @@
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/device.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/drivers/adc.h>
 
-/*
- * The hello world demo has two threads that utilize semaphores and sleeping
- * to take turns printing a greeting message at a controlled rate. The demo
- * shows both the static and dynamic approaches for spawning a thread; a real
- * world application would likely use the static approach for both threads.
- */
 
-#define PIN_THREADS (IS_ENABLED(CONFIG_SMP) && IS_ENABLED(CONFIG_SCHED_CPU_MASK))
+/* ADC STUFF */
+	#if !DT_NODE_EXISTS(DT_PATH(zephyr_user)) || \
+		!DT_NODE_HAS_PROP(DT_PATH(zephyr_user), io_channels)
+	#error "No suitable devicetree overlay specified"
+	#endif
 
-/* size of stack area used by each thread */
-#define STACKSIZE 1024
+	#define DT_SPEC_AND_COMMA(node_id, prop, idx) \
+		ADC_DT_SPEC_GET_BY_IDX(node_id, idx),
 
-/* scheduling priority used by each thread */
-#define PRIORITY 7
+	/* Data of ADC io-channels specified in devicetree. */
+	static const struct adc_dt_spec adc_channels[] = {
+		DT_FOREACH_PROP_ELEM(DT_PATH(zephyr_user), io_channels,
+					DT_SPEC_AND_COMMA)
+	};
+			int err;
+		uint32_t count = 0;
+		uint16_t buf;
+		struct adc_sequence sequence = {
+			.buffer = &buf,
+			/* buffer size in bytes, not number of samples */
+			.buffer_size = sizeof(buf),
+		};
 
-/* delay between greetings (in ms) */
-#define SLEEPTIME 500
 
-/* The devicetree node identifier for the "led0" alias. */
-#define LED0_NODE DT_ALIAS(led0)
+/* THREADS STUFF */
+	#define PIN_THREADS (IS_ENABLED(CONFIG_SMP) && IS_ENABLED(CONFIG_SCHED_CPU_MASK))
+	/* size of stack area used by each thread */
+	#define STACKSIZE 1024
+	/* scheduling priority used by each thread */
+	#define PRIORITY 7
+	/* delay between greetings (in ms) */
+	#define SLEEPTIME 500
+
+/* LED GPIO STUFF */
+	/* The devicetree node identifier for the "led0" alias. */
+	#define LED0_NODE DT_ALIAS(led0)
 /*
  * A build error on this line means your board is unsupported.
  * See the sample documentation for information on how to fix this.
@@ -46,6 +66,7 @@ void helloLoop(const char *my_name,
 	const char *tname;
 	uint8_t cpu;
 	struct k_thread *current_thread;
+
 
 	while (1) {
 		/* take my semaphore */
@@ -67,10 +88,49 @@ void helloLoop(const char *my_name,
 				tname, cpu, CONFIG_BOARD);
 		}
 
+		/* TOGGLE LED*/
 		gpio_pin_toggle_dt(&led);
 
+		/* ADC READS */
+		printk("ADC reading[%u]:\n", count++);
+		for (size_t i = 0U; i < ARRAY_SIZE(adc_channels); i++) {
+			int32_t val_mv;
+
+			printk("- %s, channel %d: ",
+			       adc_channels[i].dev->name,
+			       adc_channels[i].channel_id);
+
+			(void)adc_sequence_init_dt(&adc_channels[i], &sequence);
+
+			err = adc_read(adc_channels[i].dev, &sequence);
+			if (err < 0) {
+				printk("Could not read (%d)\n", err);
+				continue;
+			}
+
+			/*
+			 * If using differential mode, the 16 bit value
+			 * in the ADC sample buffer should be a signed 2's
+			 * complement value.
+			 */
+			if (adc_channels[i].channel_cfg.differential) {
+				val_mv = (int32_t)((int16_t)buf);
+			} else {
+				val_mv = (int32_t)buf;
+			}
+			printk("%"PRId32, val_mv);
+			err = adc_raw_to_millivolts_dt(&adc_channels[i],
+						       &val_mv);
+			/* conversion to mV may not be supported, skip if not */
+			if (err < 0) {
+				printk(" (value in mV not available)\n");
+			} else {
+				printk(" = %"PRId32" mV\n", val_mv);
+			}
+		}
+
 		/* wait a while, then let other thread have a turn */
-		k_busy_wait(100000);
+		k_busy_wait(1000000);
 		k_msleep(SLEEPTIME);
 		k_sem_give(other_sem);
 	}
@@ -114,36 +174,53 @@ void threadA(void *dummy1, void *dummy2, void *dummy3)
 
 int main(void)
 {
-	if (!gpio_is_ready_dt(&led)) {
-		return 0;
-	}
-	int ret;
-	ret = gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
-	if (ret < 0) {
-		return 0;
-	}
+	/* ADC INIT*/
 
-	k_thread_create(&threadA_data, threadA_stack_area,
-			K_THREAD_STACK_SIZEOF(threadA_stack_area),
-			threadA, NULL, NULL, NULL,
-			PRIORITY, 0, K_FOREVER);
-	k_thread_name_set(&threadA_data, "thread_a");
-#if PIN_THREADS
-	if (arch_num_cpus() > 1) {
-		k_thread_cpu_pin(&threadA_data, 0);
-	}
-#endif
+		/* Configure channels individually prior to sampling. */
+		for (size_t i = 0U; i < ARRAY_SIZE(adc_channels); i++) {
+			if (!device_is_ready(adc_channels[i].dev)) {
+				printk("ADC controller device %s not ready\n", adc_channels[i].dev->name);
+				return 0;
+			}
 
-	k_thread_create(&threadB_data, threadB_stack_area,
-			K_THREAD_STACK_SIZEOF(threadB_stack_area),
-			threadB, NULL, NULL, NULL,
-			PRIORITY, 0, K_FOREVER);
-	k_thread_name_set(&threadB_data, "thread_b");
-#if PIN_THREADS
-	if (arch_num_cpus() > 1) {
-		k_thread_cpu_pin(&threadB_data, 1);
-	}
-#endif
+			err = adc_channel_setup_dt(&adc_channels[i]);
+			if (err < 0) {
+				printk("Could not setup channel #%d (%d)\n", i, err);
+				return 0;
+			}
+		}
+	/* GPIO LED INIT */
+		if (!gpio_is_ready_dt(&led)) {
+			return 0;
+		}
+		int ret;
+		ret = gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
+		if (ret < 0) {
+			return 0;
+		}
+
+	/* THREADS INIT */
+		k_thread_create(&threadA_data, threadA_stack_area,
+				K_THREAD_STACK_SIZEOF(threadA_stack_area),
+				threadA, NULL, NULL, NULL,
+				PRIORITY, 0, K_FOREVER);
+		k_thread_name_set(&threadA_data, "thread_a");
+	#if PIN_THREADS
+		if (arch_num_cpus() > 1) {
+			k_thread_cpu_pin(&threadA_data, 0);
+		}
+	#endif
+
+		k_thread_create(&threadB_data, threadB_stack_area,
+				K_THREAD_STACK_SIZEOF(threadB_stack_area),
+				threadB, NULL, NULL, NULL,
+				PRIORITY, 0, K_FOREVER);
+		k_thread_name_set(&threadB_data, "thread_b");
+	#if PIN_THREADS
+		if (arch_num_cpus() > 1) {
+			k_thread_cpu_pin(&threadB_data, 1);
+		}
+	#endif
 
 	k_thread_start(&threadA_data);
 	k_thread_start(&threadB_data);

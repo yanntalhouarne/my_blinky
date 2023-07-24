@@ -1,0 +1,1 @@
+west build -p auto -b nrf52840dk_nrf52840
